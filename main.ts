@@ -37,10 +37,21 @@
 // of an offline exit node is that ChatGPT/Claude/Grok stop working;
 // other sites are unaffected.
 
-const PSK = Deno.env.get("EXIT_NODE_PSK") ?? "";
-if (!PSK) {
-  return Response.json({ e: "exit_node misconfigured: PSK not set" }, { status: 503 });
-}
+
+// ── Sentinels — DO NOT EDIT ─────────────────────────────────
+// These two constants are NOT configuration. They are the literal
+// template-default values used by the fail-closed check in doPost so
+// that a forgotten edit (AUTH_KEY or WORKER_URL still set to the
+// placeholder) returns a loud error instead of silently accepting the
+// placeholder secret or POSTing to a bogus URL. Configure AUTH_KEY
+// and WORKER_URL above; leave these alone.
+const DEFAULT_PSK = "CHANGE_ME_TO_A_STRONG_SECRET";
+
+const PSK = Deno.env.get("EXIT_NODE_PSK") ?? DEFAULT_PSK;
+
+// Tunables — keep permissive; adjust if you want shorter timeouts
+const FETCH_TIMEOUT_MS = 25_000; // abort outbound fetches after 25s by default
+const DNS_CACHE_TTL_MS = 60_000; // 60s DNS cache
 
 // Headers the client may send that must NOT be forwarded to the
 // destination — they're hop-by-hop or would break re-encoding.
@@ -79,23 +90,60 @@ function sanitizeHeaders(h: unknown): Record<string, string> {
   for (const [k, v] of Object.entries(h as Record<string, unknown>)) {
     if (!k) continue;
     if (STRIP_HEADERS.has(k.toLowerCase())) continue;
-    out[k] = String(v ?? "");
+    out[k.toLowerCase()] = String(v ?? "");
   }
   return out;
 }
 
+// Very small DNS cache to reduce repeated lookups
+const dnsCache = new Map<string, { ts: number; addrs: string[] }>();
+async function resolveHostCached(host: string): Promise<string[]> {
+  const now = Date.now();
+  const cached = dnsCache.get(host);
+  if (cached && now - cached.ts < DNS_CACHE_TTL_MS) return cached.addrs;
+  const addrs: string[] = [];
+  try {
+    const a = await Deno.resolveDns(host, "A").catch(() => []);
+    for (const ip of a) addrs.push(ip);
+  } catch {}
+  try {
+    const aaaa = await Deno.resolveDns(host, "AAAA").catch(() => []);
+    for (const ip of aaaa) addrs.push(ip);
+  } catch {}
+  dnsCache.set(host, { ts: now, addrs });
+  return addrs;
+}
+
+// Lightweight usage counters (in-memory)
+let totalRequests = 0;
+let totalBytesProxied = 0;
+
 export default async function (req: Request): Promise<Response> {
+  // health check
+  try {
+    const url = new URL(req.url);
+    if (req.method === "GET" && url.pathname === "/healthz") {
+      return new Response("ok", { status: 200 });
+    }
+  } catch {
+    // ignore URL parse errors for health check path handling
+  }
+
   // Fail closed on the placeholder PSK so a fresh deploy without setup
   // can't accidentally serve as an open relay.
-  if (PSK === "CHANGE_ME_TO_A_STRONG_SECRET") {
+  if (PSK === DEFAULT_PSK) {
     return Response.json(
       {
         e:
-          "exit_node misconfigured: PSK is still the placeholder. Set " +
+          "exit_node misconfigured: PSK. Set " +
           "a strong secret in the source before deploying.",
       },
       { status: 503 },
     );
+  }
+
+  if (!PSK) {
+    return Response.json({ e: "exit_node misconfigured: PSK not set" }, { status: 503 });
   }
 
   try {
@@ -103,7 +151,7 @@ export default async function (req: Request): Promise<Response> {
       return Response.json({ e: "method_not_allowed" }, { status: 405 });
     }
 
-    const body = await req.json();
+    const body = await req.json().catch(() => null);
     if (!body || typeof body !== "object") {
       return Response.json({ e: "bad_json" }, { status: 400 });
     }
@@ -137,23 +185,44 @@ export default async function (req: Request): Promise<Response> {
       // Malformed URL — let the fetch below 400.
     }
 
+    // Resolve host once (benefit: reduce DNS queries)
+    let dstHost = "";
+    try {
+      dstHost = new URL(u).hostname;
+      // async resolve (not enforced); helps Deno Deploy internal resolver caching
+      resolveHostCached(dstHost).catch(() => {});
+    } catch {
+      // ignore
+    }
+
     let payload: Uint8Array | undefined;
     if (typeof b64 === "string" && b64.length > 0) {
       payload = decodeBase64ToBytes(b64);
     }
 
+    totalRequests++;
+
+    // AbortController to avoid runaway fetches consuming runtime
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
     const resp = await fetch(u, {
       method: m,
       headers: h,
       body: payload,
       redirect: "manual",
-    });
+      signal: ac.signal,
+    }).finally(() => clearTimeout(to));
 
     const data = new Uint8Array(await resp.arrayBuffer());
+    totalBytesProxied += data.byteLength;
+
     const respHeaders: Record<string, string> = {};
     resp.headers.forEach((value, key) => {
-      respHeaders[key] = value;
+      respHeaders[key.toLowerCase()] = value;
     });
+
+    // Minimal log to help you monitor usage without heavy overhead
+    console.log(`[proxy] ${m} ${dstHost} -> ${resp.status} bytes=${data.byteLength} totalReq=${totalRequests} totalBytes=${totalBytesProxied}`);
 
     return Response.json({
       s: resp.status,
@@ -162,6 +231,7 @@ export default async function (req: Request): Promise<Response> {
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    console.error(`[err] ${message}`);
     return Response.json({ e: message }, { status: 500 });
   }
 }
