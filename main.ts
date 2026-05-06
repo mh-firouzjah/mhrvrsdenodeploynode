@@ -118,7 +118,7 @@ async function resolveHostCached(host: string): Promise<string[]> {
 let totalRequests = 0;
 let totalBytesProxied = 0;
 
-export default async function (req: Request): Promise<Response> {
+Deno.serve((req: Request) => {
   // health check
   try {
     const url = new URL(req.url);
@@ -234,4 +234,12 @@ export default async function (req: Request): Promise<Response> {
     console.error(`[err] ${message}`);
     return Response.json({ e: message }, { status: 500 });
   }
-}
+});
+
+
+
+
+
+
+
+           
