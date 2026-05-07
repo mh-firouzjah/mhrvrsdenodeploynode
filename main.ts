@@ -1,237 +1,95 @@
-// mhrv-rs exit node — deploy as an HTTP endpoint on any serverless
-// TypeScript host with a public IP that isn't a Google datacenter
-// (Deno Deploy, fly.io, your own VPS, etc.). Uses only web-standard
-// `Request` / `Response` / `fetch` so it's portable across runtimes.
-//
-// Purpose: chain client → Apps Script → this exit node → destination.
-// Apps Script's UrlFetchApp can't reach Cloudflare-protected sites that
-// flag Google datacenter IPs as bots (chatgpt.com, claude.ai, grok.com,
-// many other CF-fronted SaaS). This exit node sits between Apps Script
-// and the destination; the destination sees the exit node's outbound IP
-// (generally not flagged as Google datacenter) and accepts the request.
-//
-// Setup:
-//   1. Pick a host that runs web-standard fetch handlers (e.g. Deno
-//      Deploy, fly.io with a thin server wrapper, or any cheap VPS
-//      running Deno / Node + this script as a handler).
-//   2. Paste the contents of this file as the request handler.
-//   3. Set PSK below to a strong secret (`openssl rand -hex 32` from
-//      a terminal — DO NOT leave the placeholder in production).
-//   4. Deploy and copy the public URL of the deployed handler.
-//   5. In mhrv-rs config.json, add:
-//        "exit_node": {
-//          "enabled": true,
-//          "relay_url": "https://your-deployed-exit-node.example.com",
-//          "psk": "<the same PSK you set above>",
-//          "mode": "selective",
-//          "hosts": ["chatgpt.com", "claude.ai", "x.com", "grok.com"]
-//        }
-//
-// Threat model: PSK is the only thing keeping this from being an open
-// proxy on the public internet. Treat it like a password: do not commit
-// to source control, do not share publicly, rotate if leaked. The exit
-// node refuses all requests that don't carry the matching PSK.
-//
-// Failure mode: if the exit node is unreachable, mhrv-rs falls back to
-// the regular Apps Script relay automatically — the only consequence
-// of an offline exit node is that ChatGPT/Claude/Grok stop working;
-// other sites are unaffected.
+const AUTH_KEY = Deno.env.get("EXIT_NODE_PSK") ?? "CHANGE_ME_TO_A_STRONG_SECRET";
+const DEFAULT_AUTH_KEY = "CHANGE_ME_TO_A_STRONG_SECRET";
+const MAX_BATCH = 40;
 
-
-// ── Sentinels — DO NOT EDIT ─────────────────────────────────
-// These two constants are NOT configuration. They are the literal
-// template-default values used by the fail-closed check in doPost so
-// that a forgotten edit (AUTH_KEY or WORKER_URL still set to the
-// placeholder) returns a loud error instead of silently accepting the
-// placeholder secret or POSTing to a bogus URL. Configure AUTH_KEY
-// and WORKER_URL above; leave these alone.
-const DEFAULT_PSK = "CHANGE_ME_TO_A_STRONG_SECRET";
-
-const PSK = Deno.env.get("EXIT_NODE_PSK") ?? DEFAULT_PSK;
-
-// Tunables — keep permissive; adjust if you want shorter timeouts
-const FETCH_TIMEOUT_MS = 25_000; // abort outbound fetches after 25s by default
-const DNS_CACHE_TTL_MS = 60_000; // 60s DNS cache
-
-// Headers the client may send that must NOT be forwarded to the
-// destination — they're hop-by-hop or would break re-encoding.
-const STRIP_HEADERS = new Set([
-  "host",
-  "connection",
-  "content-length",
-  "transfer-encoding",
-  "proxy-connection",
-  "proxy-authorization",
-  "x-forwarded-for",
-  "x-forwarded-host",
-  "x-forwarded-proto",
-  "x-forwarded-port",
-  "x-real-ip",
-  "forwarded",
-  "via",
+const SKIP_HEADERS = new Set([
+  "host", "connection", "content-length", "transfer-encoding", "proxy-authorization",
+  "proxy-connection", "priority", "te"
 ]);
 
-function decodeBase64ToBytes(input: string): Uint8Array {
-  const bin = atob(input);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
+function base64Encode(buf: Uint8Array): string {
+  // chunked encoding for large payloads
+  let out = "", i = 0, chunk = 65535;
+  for (; i < buf.length; i += chunk) out += String.fromCharCode(...buf.subarray(i, i + chunk));
+  return btoa(out);
 }
 
-function encodeBytesToBase64(bytes: Uint8Array): string {
-  let bin = "";
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin);
+function scrubHeaders(h?: Record<string, string>) {
+  const res: Record<string, string> = {};
+  for (const k in h) if (!SKIP_HEADERS.has(k.toLowerCase())) res[k] = h[k];
+  return res;
 }
 
-function sanitizeHeaders(h: unknown): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (!h || typeof h !== "object") return out;
-  for (const [k, v] of Object.entries(h as Record<string, unknown>)) {
-    if (!k) continue;
-    if (STRIP_HEADERS.has(k.toLowerCase())) continue;
-    out[k.toLowerCase()] = String(v ?? "");
+async function processOne(item: any, selfHost: string): Promise<any> {
+  if (!item || typeof item !== "object" || !item.u || typeof item.u !== "string" || !/^https?:\/\//i.test(item.u)) {
+    return { e: "bad url" };
   }
-  return out;
-}
+  let targetUrl: URL;
+  try { targetUrl = new URL(item.u); }
+  catch { return { e: "bad url" }; }
+  if (targetUrl.hostname === selfHost) return { e: "self-fetch blocked" };
 
-// Very small DNS cache to reduce repeated lookups
-const dnsCache = new Map<string, { ts: number; addrs: string[] }>();
-async function resolveHostCached(host: string): Promise<string[]> {
-  const now = Date.now();
-  const cached = dnsCache.get(host);
-  if (cached && now - cached.ts < DNS_CACHE_TTL_MS) return cached.addrs;
-  const addrs: string[] = [];
-  try {
-    const a = await Deno.resolveDns(host, "A").catch(() => []);
-    for (const ip of a) addrs.push(ip);
-  } catch {}
-  try {
-    const aaaa = await Deno.resolveDns(host, "AAAA").catch(() => []);
-    for (const ip of aaaa) addrs.push(ip);
-  } catch {}
-  dnsCache.set(host, { ts: now, addrs });
-  return addrs;
-}
+  const headers = new Headers();
+  if (item.h && typeof item.h === "object") {
+    Object.entries(item.h).forEach(([k, v]) => {
+      if (!SKIP_HEADERS.has(k.toLowerCase())) {
+        try { headers.set(k, v as string); } catch {}
+      }
+    });
+  }
+  headers.set("x-relay-hop", "1");
 
-// Lightweight usage counters (in-memory)
-let totalRequests = 0;
-let totalBytesProxied = 0;
+  const method = (item.m || "GET").toUpperCase();
+  const opts: RequestInit = { method, headers, redirect: item.r === false ? "manual" : "follow" };
+
+  // Only attach body for POST/PUT/PATCH, never for GET/HEAD (Worker and Deno differ from browsers)
+  if (method !== "GET" && method !== "HEAD" && typeof item.b === "string" && item.b.length > 0) {
+    try {
+      const binary = Uint8Array.from(atob(item.b), c => c.charCodeAt(0));
+      opts.body = binary;
+      if (item.ct && !headers.has("content-type")) headers.set("content-type", item.ct);
+    } catch { return { e: "bad body base64" }; }
+  }
+
+  let resp: Response;
+  try { resp = await fetch(targetUrl.toString(), opts); }
+  catch (error) { return { e: "fetch failed: "+String(error) }; }
+
+  const buffer = new Uint8Array(await resp.arrayBuffer());
+  const base64 = base64Encode(buffer);
+
+  const responseHeaders: Record<string, string> = {};
+  resp.headers.forEach((v, k) => { responseHeaders[k] = v; });
+  return {
+    s: resp.status,
+    h: responseHeaders,
+    b: base64,
+  };
+}
 
 Deno.serve(async (req: Request): Promise<Response> => {
-  // health check
-  try {
-    const url = new URL(req.url);
-    if (req.method === "GET" && url.pathname === "/healthz") {
-      return new Response("ok", { status: 200 });
-    }
-  } catch {
-    // ignore URL parse errors for health check path handling
+  if (AUTH_KEY === DEFAULT_AUTH_KEY) {
+    return Response.json({ e: "configure EXIT_NODE_PSK in env" }, { status: 500 });
   }
-
-  // Fail closed on the placeholder PSK so a fresh deploy without setup
-  // can't accidentally serve as an open relay.
-  if (PSK === DEFAULT_PSK) {
-    return Response.json(
-      {
-        e:
-          "exit_node misconfigured: PSK. Set " +
-          "a strong secret in the source before deploying.",
-      },
-      { status: 503 },
-    );
+  if (req.method !== "POST") {
+    return Response.json({ e: "method not allowed" }, { status: 405 });
   }
-
-  if (!PSK) {
-    return Response.json({ e: "exit_node misconfigured: PSK not set" }, { status: 503 });
+  let body: any;
+  try { body = await req.json(); }
+  catch { return Response.json({ e: "bad json" }, { status: 400 }); }
+  if (!body || body.k !== AUTH_KEY) {
+    return Response.json({ e: "unauthorized" }, { status: 401 });
   }
+  const selfHost = new URL(req.url).hostname;
 
-  try {
-    if (req.method !== "POST") {
-      return Response.json({ e: "method_not_allowed" }, { status: 405 });
-    }
-
-    const body = await req.json().catch(() => null);
-    if (!body || typeof body !== "object") {
-      return Response.json({ e: "bad_json" }, { status: 400 });
-    }
-
-    const k = String((body as any).k ?? "");
-    const u = String((body as any).u ?? "");
-    const m = String((body as any).m ?? "GET").toUpperCase();
-    const h = sanitizeHeaders((body as any).h);
-    const b64 = (body as any).b;
-
-    if (k !== PSK) {
-      return Response.json({ e: "unauthorized" }, { status: 401 });
-    }
-    if (!/^https?:\/\//i.test(u)) {
-      return Response.json({ e: "bad url" }, { status: 400 });
-    }
-
-    // Loop guard: if u points at this exit node's own host, refuse.
-    // Without this, a misconfigured client could chain exit-node →
-    // exit-node → exit-node → ... and burn the host's runtime budget.
-    try {
-      const reqUrl = new URL(req.url);
-      const dstUrl = new URL(u);
-      if (
-        reqUrl.host === dstUrl.host &&
-        reqUrl.protocol === dstUrl.protocol
-      ) {
-        return Response.json({ e: "exit-node loop refused" }, { status: 400 });
-      }
-    } catch {
-      // Malformed URL — let the fetch below 400.
-    }
-
-    // Resolve host once (benefit: reduce DNS queries)
-    let dstHost = "";
-    try {
-      dstHost = new URL(u).hostname;
-      // async resolve (not enforced); helps Deno Deploy internal resolver caching
-      resolveHostCached(dstHost).catch(() => {});
-    } catch {
-      // ignore
-    }
-
-    let payload: Uint8Array | undefined;
-    if (typeof b64 === "string" && b64.length > 0) {
-      payload = decodeBase64ToBytes(b64);
-    }
-
-    totalRequests++;
-
-    // AbortController to avoid runaway fetches consuming runtime
-    const ac = new AbortController();
-    const to = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
-    const resp = await fetch(u, {
-      method: m,
-      headers: h,
-      body: payload,
-      redirect: "manual",
-      signal: ac.signal,
-    }).finally(() => clearTimeout(to));
-
-    const data = new Uint8Array(await resp.arrayBuffer());
-    totalBytesProxied += data.byteLength;
-
-    const respHeaders: Record<string, string> = {};
-    resp.headers.forEach((value, key) => {
-      respHeaders[key.toLowerCase()] = value;
-    });
-
-    // Minimal log to help you monitor usage without heavy overhead
-    console.log(`[proxy] ${m} ${dstHost} -> ${resp.status} bytes=${data.byteLength} totalReq=${totalRequests} totalBytes=${totalBytesProxied}`);
-
-    return Response.json({
-      s: resp.status,
-      h: respHeaders,
-      b: encodeBytesToBase64(data),
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[err] ${message}`);
-    return Response.json({ e: message }, { status: 500 });
+  // Batch route
+  if (Array.isArray(body.q)) {
+    if (body.q.length > MAX_BATCH) return Response.json({ e: "batch too large" }, { status: 400 });
+    const results = await Promise.all(body.q.map(
+      item => processOne(item, selfHost).catch(e => ({ e: "process err:"+String(e) }))
+    ));
+    return Response.json({ q: results });
   }
+  // Single
+  return Response.json(await processOne(body, selfHost));
 });
