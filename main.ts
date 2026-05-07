@@ -4,11 +4,12 @@ const MAX_BATCH = 40;
 
 const SKIP_HEADERS = new Set([
   "host", "connection", "content-length", "transfer-encoding", "proxy-authorization",
-  "proxy-connection", "priority", "te"
+  "proxy-connection", "priority", "te",
+  "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto",
+  "x-forwarded-port", "x-real-ip", "forwarded", "via"
 ]);
 
 function base64Encode(buf: Uint8Array): string {
-  // chunked encoding for large payloads
   let out = "", i = 0, chunk = 65535;
   for (; i < buf.length; i += chunk) out += String.fromCharCode(...buf.subarray(i, i + chunk));
   return btoa(out);
@@ -37,12 +38,10 @@ async function processOne(item: any, selfHost: string): Promise<any> {
       }
     });
   }
-  headers.set("x-relay-hop", "1");
 
   const method = (item.m || "GET").toUpperCase();
   const opts: RequestInit = { method, headers, redirect: item.r === false ? "manual" : "follow" };
 
-  // Only attach body for POST/PUT/PATCH, never for GET/HEAD (Worker and Deno differ from browsers)
   if (method !== "GET" && method !== "HEAD" && typeof item.b === "string" && item.b.length > 0) {
     try {
       const binary = Uint8Array.from(atob(item.b), c => c.charCodeAt(0));
@@ -60,6 +59,7 @@ async function processOne(item: any, selfHost: string): Promise<any> {
 
   const responseHeaders: Record<string, string> = {};
   resp.headers.forEach((v, k) => { responseHeaders[k] = v; });
+
   return {
     s: resp.status,
     h: responseHeaders,
@@ -72,6 +72,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     return Response.json({ e: "configure EXIT_NODE_PSK in env" }, { status: 500 });
   }
   if (req.method !== "POST") {
+    // (Optional: You may prefer to return a decoy HTML page here; this answer uses strict JSON.)
     return Response.json({ e: "method not allowed" }, { status: 405 });
   }
   let body: any;
@@ -82,14 +83,15 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
   const selfHost = new URL(req.url).hostname;
 
-  // Batch route
+  // Batch
   if (Array.isArray(body.q)) {
     if (body.q.length > MAX_BATCH) return Response.json({ e: "batch too large" }, { status: 400 });
-    const results = await Promise.all(body.q.map(
-      item => processOne(item, selfHost).catch(e => ({ e: "process err:"+String(e) }))
-    ));
+    const results = await Promise.all(
+      body.q.map(item => processOne(item, selfHost).catch(e => ({ e: "process err:"+String(e) })))
+    );
     return Response.json({ q: results });
   }
+
   // Single
   return Response.json(await processOne(body, selfHost));
 });
