@@ -14,7 +14,7 @@
  * CHANGE THE AUTH KEY BELOW TO YOUR OWN SECRET!
  */
 
-const AUTH_KEY = "CHANGE_ME_TO_A_STRONG_SECRET";
+const AUTH_KEY = Deno.env.get("EXIT_NODE_PSK") ?? "CHANGE_ME_TO_A_STRONG_SECRET";
 
 // Active-probing defense. When false (production default), bad AUTH_KEY
 // requests get a decoy HTML page that looks like a placeholder web app
@@ -107,10 +107,10 @@ interface FetchResult {
 // ── Response Helpers ────────────────────────────────────
 
 function _decoyOrError(jsonBody: Record<string, string>): Response {
-    return new Response(JSON.stringify(jsonBody), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
+  return new Response(JSON.stringify(jsonBody), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 function _json(obj: Record<string, unknown>): Response {
