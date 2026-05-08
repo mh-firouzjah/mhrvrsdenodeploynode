@@ -83,75 +83,77 @@ function sanitizeHeaders(h: unknown): Record<string, string> {
   return out;
 }
 
-Deno.serve(async (req: Request): Promise<Response> => {
-  // Fail closed on the placeholder PSK so a fresh deploy without setup
-  // can't accidentally serve as an open relay.
-  if (PSK === "CHANGE_ME_TO_A_STRONG_SECRET") {
-    return Response.json({ e: "configure EXIT_NODE_PSK in env" }, { status: 503 });
-  }
-
-  try {
-    if (req.method !== "POST") {
-      return Response.json({ e: "method_not_allowed" }, { status: 405 });
+export default {
+  async function(req: Request): Promise<Response> {
+    // Fail closed on the placeholder PSK so a fresh deploy without setup
+    // can't accidentally serve as an open relay.
+    if (PSK === "CHANGE_ME_TO_A_STRONG_SECRET") {
+      return Response.json({ e: "configure EXIT_NODE_PSK in env" }, { status: 503 });
     }
 
-    const body = await req.json();
-    if (!body || typeof body !== "object") {
-      return Response.json({ e: "bad_json" }, { status: 400 });
-    }
-
-    const k = String((body as any).k ?? "");
-    const u = String((body as any).u ?? "");
-    const m = String((body as any).m ?? "GET").toUpperCase();
-    const h = sanitizeHeaders((body as any).h);
-    const b64 = (body as any).b;
-
-    if (k !== PSK) {
-      return Response.json({ e: "unauthorized" }, { status: 401 });
-    }
-    if (!/^https?:\/\//i.test(u)) {
-      return Response.json({ e: "bad_url" }, { status: 400 });
-    }
-
-    // Loop guard: if u points at this exit node's own host, refuse.
-    // Without this, a misconfigured client could chain exit-node →
-    // exit-node → exit-node → ... and burn the host's runtime budget.
     try {
-      const reqUrl = new URL(req.url);
-      const dstUrl = new URL(u);
-      if (
-        reqUrl.host === dstUrl.host &&
-        reqUrl.protocol === dstUrl.protocol
-      ) {
-        return Response.json({ e: "exit-node loop refused" }, { status: 400 });
+      if (req.method !== "POST") {
+        return Response.json({ e: "method_not_allowed" }, { status: 405 });
       }
-    } catch {
-      // Malformed URL — let the fetch below 400.
+
+      const body = await req.json();
+      if (!body || typeof body !== "object") {
+        return Response.json({ e: "bad_json" }, { status: 400 });
+      }
+
+      const k = String((body as any).k ?? "");
+      const u = String((body as any).u ?? "");
+      const m = String((body as any).m ?? "GET").toUpperCase();
+      const h = sanitizeHeaders((body as any).h);
+      const b64 = (body as any).b;
+
+      if (k !== PSK) {
+        return Response.json({ e: "unauthorized" }, { status: 401 });
+      }
+      if (!/^https?:\/\//i.test(u)) {
+        return Response.json({ e: "bad_url" }, { status: 400 });
+      }
+
+      // Loop guard: if u points at this exit node's own host, refuse.
+      // Without this, a misconfigured client could chain exit-node →
+      // exit-node → exit-node → ... and burn the host's runtime budget.
+      try {
+        const reqUrl = new URL(req.url);
+        const dstUrl = new URL(u);
+        if (
+          reqUrl.host === dstUrl.host &&
+          reqUrl.protocol === dstUrl.protocol
+        ) {
+          return Response.json({ e: "exit-node loop refused" }, { status: 400 });
+        }
+      } catch {
+        // Malformed URL — let the fetch below 400.
+      }
+
+      let payload: Uint8Array | undefined;
+      if (typeof b64 === "string" && b64.length > 0) {
+        payload = decodeBase64ToBytes(b64);
+      }
+
+      const resp = await fetch(u, {
+        method: m,
+        headers: h,
+        body: payload,
+        redirect: "manual",
+      });
+
+      const data = new Uint8Array(await resp.arrayBuffer());
+      const respHeaders: Record<string, string> = {};
+      resp.headers.forEach((value, key) => { respHeaders[ key ] = value; });
+
+      return Response.json({
+        s: resp.status,
+        h: respHeaders,
+        b: encodeBytesToBase64(data),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return Response.json({ e: message }, { status: 500 });
     }
-
-    let payload: Uint8Array | undefined;
-    if (typeof b64 === "string" && b64.length > 0) {
-      payload = decodeBase64ToBytes(b64);
-    }
-
-    const resp = await fetch(u, {
-      method: m,
-      headers: h,
-      body: payload,
-      redirect: "manual",
-    });
-
-    const data = new Uint8Array(await resp.arrayBuffer());
-    const respHeaders: Record<string, string> = {};
-    resp.headers.forEach((value, key) => { respHeaders[ key ] = value; });
-
-    return Response.json({
-      s: resp.status,
-      h: respHeaders,
-      b: encodeBytesToBase64(data),
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return Response.json({ e: message }, { status: 500 });
   }
-});
+} satisfies Deno.ServeDefaultExport;
