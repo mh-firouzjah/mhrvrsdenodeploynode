@@ -38,7 +38,6 @@
 // other sites are unaffected.
 
 const PSK = Deno.env.get("EXIT_NODE_PSK") ?? "CHANGE_ME_TO_A_STRONG_SECRET";
-const DIAGNOSTIC_MODE = false;
 
 // Headers the client may send that must NOT be forwarded to the
 // destination — they're hop-by-hop or would break re-encoding.
