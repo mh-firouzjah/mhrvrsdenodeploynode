@@ -61,14 +61,6 @@ const SAFE_REPLAY_METHODS: Record<string, number> = {
   OPTIONS: 1,
 };
 
-// HTML body for the bad-auth decoy. Mimics a minimal web app placeholder
-// page — no proxy-shaped JSON, nothing distinctive enough for a probe to
-// fingerprint as a tunnel endpoint.
-const DECOY_HTML =
-  "<!DOCTYPE html><html><head><title>Web App</title></head>" +
-  "<body><p>The script completed but did not return anything.</p>" +
-  "</body></html>";
-
 // ── Type Definitions ────────────────────────────────────
 
 interface SingleRequest {
@@ -115,16 +107,10 @@ interface FetchResult {
 // ── Response Helpers ────────────────────────────────────
 
 function _decoyOrError(jsonBody: Record<string, string>): Response {
-  if (DIAGNOSTIC_MODE) {
     return new Response(JSON.stringify(jsonBody), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
-  }
-  return new Response(DECOY_HTML, {
-    status: 200,
-    headers: { "Content-Type": "text/html" },
-  });
 }
 
 function _json(obj: Record<string, unknown>): Response {
@@ -156,13 +142,6 @@ async function handlePost(request: Request): Promise<Response> {
     // client never sends invalid JSON. Decoy for the same reason.
     return _decoyOrError({ e: String(err) });
   }
-}
-
-function handleGet(_request: Request): Response {
-  return new Response(DECOY_HTML, {
-    status: 200,
-    headers: { "Content-Type": "text/html" },
-  });
 }
 
 // ── Single Request ─────────────────────────────────────
@@ -354,8 +333,6 @@ function _base64Decode(encoded: string): Uint8Array {
 async function handleRequest(request: Request): Promise<Response> {
   if (request.method === "POST") {
     return await handlePost(request);
-  } else if (request.method === "GET") {
-    return handleGet(request);
   } else {
     return new Response("Method Not Allowed", { status: 405 });
   }
