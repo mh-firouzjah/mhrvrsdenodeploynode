@@ -159,6 +159,22 @@ async function _doSingle(req: SingleRequest): Promise<Response> {
   const resp = await fetch(req.u, opts);
   const content = await resp.arrayBuffer();
 
+  // Loop guard: if u points at this exit node's own host, refuse.
+  // Without this, a misconfigured client could chain exit-node →
+  // exit-node → exit-node → ... and burn the host's runtime budget.
+  try {
+    const reqUrl = new URL(req.u);
+    const dstUrl = new URL(resp.url);
+    if (
+      reqUrl.host === dstUrl.host &&
+      reqUrl.protocol === dstUrl.protocol
+    ) {
+      return Response.json({ e: "exit-node loop refused" }, { status: 400 });
+    }
+  } catch {
+    // Malformed URL — let the fetch below 400.
+  }
+
   return _json({
     s: resp.status,
     h: _respHeaders(resp),
