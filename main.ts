@@ -1,359 +1,169 @@
-/**
- * DomainFront Relay — Deno Deploy
- *
- * TWO modes:
- *   1. Single:  POST { k, m, u, h, b, ct, r }       → { s, h, b }
- *   2. Batch:   POST { k, q: [{m,u,h,b,ct,r}, ...] } → { q: [{s,h,b}, ...] }
- *      Uses Promise.all() — all URLs fetched IN PARALLEL.
- *
- * DEPLOYMENT:
- *   1. Push this file to your Deno Deploy project
- *   2. Change AUTH_KEY below to your own secret
- *   3. Deploy via `deployctl deploy --project=<project-name> relay.ts`
- *
- * CHANGE THE AUTH KEY BELOW TO YOUR OWN SECRET!
- */
-
-const AUTH_KEY = Deno.env.get("EXIT_NODE_PSK") ?? "CHANGE_ME_TO_A_STRONG_SECRET";
-
-// Active-probing defense. When false (production default), bad AUTH_KEY
-// requests get a decoy HTML page that looks like a placeholder web app
-// instead of the JSON `{"e":"unauthorized"}` body. This makes the
-// deployment indistinguishable from a forgotten-but-public web app to
-// active scanners that POST malformed payloads looking for proxy endpoints.
+// mhrv-rs exit node — deploy as an HTTP endpoint on any serverless
+// TypeScript host with a public IP that isn't a Google datacenter
+// (Deno Deploy, fly.io, your own VPS, etc.). Uses only web-standard
+// `Request` / `Response` / `fetch` so it's portable across runtimes.
 //
-// Set to `true` during initial setup if a misconfigured client is
-// hitting "unauthorized" and you want the explicit JSON error to debug
-// — then flip back to false before the deployment is widely shared.
-const DIAGNOSTIC_MODE = false;
+// Purpose: chain client → Apps Script → this exit node → destination.
+// Apps Script's UrlFetchApp can't reach Cloudflare-protected sites that
+// flag Google datacenter IPs as bots (chatgpt.com, claude.ai, grok.com,
+// many other CF-fronted SaaS). This exit node sits between Apps Script
+// and the destination; the destination sees the exit node's outbound IP
+// (generally not flagged as Google datacenter) and accepts the request.
+//
+// Setup:
+//   1. Pick a host that runs web-standard fetch handlers (e.g. Deno
+//      Deploy, fly.io with a thin server wrapper, or any cheap VPS
+//      running Deno / Node + this script as a handler).
+//   2. Paste the contents of this file as the request handler.
+//   3. Set PSK below to a strong secret (`openssl rand -hex 32` from
+//      a terminal — DO NOT leave the placeholder in production).
+//   4. Deploy and copy the public URL of the deployed handler.
+//   5. In mhrv-rs config.json, add:
+//        "exit_node": {
+//          "enabled": true,
+//          "relay_url": "https://your-deployed-exit-node.example.com",
+//          "psk": "<the same PSK you set above>",
+//          "mode": "selective",
+//          "hosts": ["chatgpt.com", "claude.ai", "x.com", "grok.com"]
+//        }
+//
+// Threat model: PSK is the only thing keeping this from being an open
+// proxy on the public internet. Treat it like a password: do not commit
+// to source control, do not share publicly, rotate if leaked. The exit
+// node refuses all requests that don't carry the matching PSK.
+//
+// Failure mode: if the exit node is unreachable, mhrv-rs falls back to
+// the regular Apps Script relay automatically — the only consequence
+// of an offline exit node is that ChatGPT/Claude/Grok stop working;
+// other sites are unaffected.
 
-// Connection-level + IP-leak request headers we strip before forwarding
-// to the destination. Browser capability headers (sec-ch-ua*, sec-fetch-*)
-// stay intact — modern apps like Google Meet use them for browser gating.
-// We also drop the `X-Forwarded-*` / `Forwarded` / `Via` family so a
-// misconfigured upstream proxy on the user side can't leak the user's
-// real IP through the relay path.
-const SKIP_HEADERS: Record<string, number> = {
-  host: 1,
-  connection: 1,
-  "content-length": 1,
-  "transfer-encoding": 1,
-  "proxy-connection": 1,
-  "proxy-authorization": 1,
-  priority: 1,
-  te: 1,
-  "x-forwarded-for": 1,
-  "x-forwarded-host": 1,
-  "x-forwarded-proto": 1,
-  "x-forwarded-port": 1,
-  "x-real-ip": 1,
-  forwarded: 1,
-  via: 1,
-};
+const PSK = Deno.env.get("EXIT_NODE_PSK") ?? "CHANGE_ME_TO_A_STRONG_SECRET";
 
-// Methods we consider safe to replay if batch fetch fails.
-// GET/HEAD/OPTIONS are idempotent per RFC 9110; POST/PUT/PATCH/DELETE
-// can have side-effects so we surface the error instead of silently
-// re-firing them.
-const SAFE_REPLAY_METHODS: Record<string, number> = {
-  GET: 1,
-  HEAD: 1,
-  OPTIONS: 1,
-};
+// Headers the client may send that must NOT be forwarded to the
+// destination — they're hop-by-hop or would break re-encoding.
+const STRIP_HEADERS = new Set([
+  "host",
+  "connection",
+  "content-length",
+  "transfer-encoding",
+  "proxy-connection",
+  "proxy-authorization",
+  "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-forwarded-port",
+  "x-real-ip",
+  "forwarded",
+  "via",
+]);
 
-// ── Type Definitions ────────────────────────────────────
-
-interface SingleRequest {
-  k: string;
-  m?: string;
-  u: string;
-  h?: Record<string, string>;
-  b?: string;
-  ct?: string;
-  r?: boolean;
+function decodeBase64ToBytes(input: string): Uint8Array {
+  const bin = atob(input);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[ i ] = bin.charCodeAt(i);
+  return out;
 }
 
-interface BatchRequestItem {
-  m?: string;
-  u: string;
-  h?: Record<string, string>;
-  b?: string;
-  ct?: string;
-  r?: boolean;
+function encodeBytesToBase64(bytes: Uint8Array): string {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[ i ]);
+  return btoa(bin);
 }
 
-interface BatchRequest {
-  k: string;
-  q: BatchRequestItem[];
+function sanitizeHeaders(h: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!h || typeof h !== "object") return out;
+  for (const [ k, v ] of Object.entries(h as Record<string, unknown>)) {
+    if (!k) continue;
+    if (STRIP_HEADERS.has(k.toLowerCase())) continue;
+    out[ k ] = String(v ?? "");
+  }
+  return out;
 }
 
-interface SingleResponse {
-  s: number;
-  h: Record<string, string>;
-  b: string;
-  e?: string;
-}
+async function requestHandler(req: Request): Promise<Response> {
+  // Fail closed on the placeholder PSK so a fresh deploy without setup
+  // can't accidentally serve as an open relay.
+  if (PSK === "CHANGE_ME_TO_A_STRONG_SECRET") {
+    return Response.json(
+      {
+        e:
+          "exit_node misconfigured: PSK is still the placeholder. Set " +
+          "a strong secret in the source before deploying.",
+      },
+      { status: 503 },
+    );
+  }
 
-interface BatchResponse {
-  q: SingleResponse[];
-}
-
-interface FetchResult {
-  status: number;
-  headers: Record<string, string>;
-  body: string;
-}
-
-// ── Response Helpers ────────────────────────────────────
-
-function _decoyOrError(jsonBody: Record<string, string>): Response {
-  return new Response(JSON.stringify(jsonBody), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-function _json(obj: Record<string, unknown>): Response {
-  return new Response(JSON.stringify(obj), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-// ── Request Handlers ────────────────────────────────────
-
-async function handlePost(request: Request): Promise<Response> {
   try {
-    const req = (await request.json()) as SingleRequest | BatchRequest;
-
-    if (req.k !== AUTH_KEY) {
-      return _decoyOrError({ e: "unauthorized" });
+    if (req.method !== "POST") {
+      return Response.json({ e: "method_not_allowed" }, { status: 405 });
     }
 
-    // Batch mode: { k, q: [...] }
-    if ("q" in req && Array.isArray(req.q)) {
-      return await _doBatch(req.q);
+    const body = await req.json();
+    if (!body || typeof body !== "object") {
+      return Response.json({ e: "bad_json" }, { status: 400 });
     }
 
-    // Single mode
-    return await _doSingle(req as SingleRequest);
-  } catch (err) {
-    // Parse failures of the request body are also probe-shaped — a real
-    // client never sends invalid JSON. Decoy for the same reason.
-    return _decoyOrError({ e: String(err) });
-  }
-}
+    const k = String((body as any).k ?? "");
+    const u = String((body as any).u ?? "");
+    const m = String((body as any).m ?? "GET").toUpperCase();
+    const h = sanitizeHeaders((body as any).h);
+    const b64 = (body as any).b;
 
-// ── Single Request ─────────────────────────────────────
-
-async function _doSingle(req: SingleRequest): Promise<Response> {
-  if (
-    !req.u ||
-    typeof req.u !== "string" ||
-    !req.u.match(/^https?:\/\//i)
-  ) {
-    return _json({ e: "bad url" });
-  }
-
-  const opts = _buildOpts(req);
-  const resp = await fetch(req.u, opts);
-  const content = await resp.arrayBuffer();
-
-  // Loop guard: if u points at this exit node's own host, refuse.
-  // Without this, a misconfigured client could chain exit-node →
-  // exit-node → exit-node → ... and burn the host's runtime budget.
-  try {
-    const reqUrl = new URL(req.u);
-    const dstUrl = new URL(resp.url);
-    if (
-      reqUrl.host === dstUrl.host &&
-      reqUrl.protocol === dstUrl.protocol
-    ) {
-      return Response.json({ e: "exit-node loop refused" }, { status: 400 });
+    if (k !== PSK) {
+      return Response.json({ e: "unauthorized" }, { status: 401 });
     }
-  } catch {
-    // Malformed URL — let the fetch below 400.
-  }
-
-  return _json({
-    s: resp.status,
-    h: _respHeaders(resp),
-    b: _base64Encode(new Uint8Array(content)),
-  });
-}
-
-// ── Batch Request ──────────────────────────────────────
-
-async function _doBatch(items: BatchRequestItem[]): Promise<Response> {
-  const fetchPromises: Promise<Response | null>[] = [];
-  const fetchIndex: number[] = [];
-  const fetchMethods: string[] = [];
-  const errorMap: Record<number, string> = {};
-
-  for (let i = 0; i < items.length; i++) {
-    const item = items[ i ];
-
-    if (!item || typeof item !== "object") {
-      errorMap[ i ] = "bad item";
-      continue;
+    if (!/^https?:\/\//i.test(u)) {
+      return Response.json({ e: "bad url" }, { status: 400 });
     }
 
-    if (
-      !item.u ||
-      typeof item.u !== "string" ||
-      !item.u.match(/^https?:\/\//i)
-    ) {
-      errorMap[ i ] = "bad url";
-      continue;
-    }
-
+    // Loop guard: if u points at this exit node's own host, refuse.
+    // Without this, a misconfigured client could chain exit-node →
+    // exit-node → exit-node → ... and burn the host's runtime budget.
     try {
-      const opts = _buildOpts(item);
-      const method = String(item.m || "GET").toUpperCase();
-      fetchMethods.push(method);
-      fetchIndex.push(i);
-
-      // Create a promise for this fetch
-      const promise = fetch(item.u, opts)
-        .then((resp) => resp)
-        .catch((err) => {
-          errorMap[ i ] = String(err);
-          return null;
-        });
-
-      fetchPromises.push(promise);
-    } catch (buildErr) {
-      errorMap[ i ] = String(buildErr);
-    }
-  }
-
-  // Fetch all requests in parallel. If one fails, we still get results
-  // for the others thanks to Promise.allSettled (or individual catch handlers).
-  let responses: (Response | null)[] = [];
-
-  if (fetchPromises.length > 0) {
-    try {
-      responses = await Promise.all(fetchPromises);
-    } catch (batchErr) {
-      // If Promise.all throws, retry safe methods individually
-      responses = [];
-      for (let j = 0; j < fetchPromises.length; j++) {
-        try {
-          const method = fetchMethods[ j ];
-          if (!SAFE_REPLAY_METHODS[ method ]) {
-            errorMap[ fetchIndex[ j ] ] =
-              "batch failed; unsafe method not replayed";
-            responses[ j ] = null;
-            continue;
-          }
-
-          const resp = await fetch(
-            (items[ fetchIndex[ j ] ].u),
-            _buildOpts(items[ fetchIndex[ j ] ])
-          );
-          responses[ j ] = resp;
-        } catch (singleErr) {
-          errorMap[ fetchIndex[ j ] ] = String(singleErr);
-          responses[ j ] = null;
-        }
-      }
-    }
-  }
-
-  const results: SingleResponse[] = [];
-  let rIdx = 0;
-
-  for (let i = 0; i < items.length; i++) {
-    if (Object.prototype.hasOwnProperty.call(errorMap, i)) {
-      results.push({ e: errorMap[ i ], s: 0, h: {}, b: "" });
-    } else {
-      const resp = responses[ rIdx++ ];
-      if (!resp) {
-        results.push({ e: "fetch failed", s: 0, h: {}, b: "" });
-      } else {
-        const content = await resp.arrayBuffer();
-        results.push({
-          s: resp.status,
-          h: _respHeaders(resp),
-          b: _base64Encode(new Uint8Array(content)),
-        });
-      }
-    }
-  }
-
-  return _json({ q: results });
-}
-
-// ── Request Building ───────────────────────────────────
-
-function _buildOpts(req: SingleRequest | BatchRequestItem): RequestInit {
-  const opts: RequestInit = {
-    method: (req.m || "GET").toLowerCase(),
-  };
-
-  if (req.h && typeof req.h === "object") {
-    const headers: Record<string, string> = {};
-    for (const k in req.h) {
+      const reqUrl = new URL(req.url);
+      const dstUrl = new URL(u);
       if (
-        req.h.hasOwnProperty(k) &&
-        !SKIP_HEADERS[ k.toLowerCase() ]
+        reqUrl.host === dstUrl.host &&
+        reqUrl.protocol === dstUrl.protocol
       ) {
-        headers[ k ] = req.h[ k ];
+        return Response.json({ e: "exit-node loop refused" }, { status: 400 });
       }
+    } catch {
+      // Malformed URL — let the fetch below 400.
     }
-    opts.headers = headers;
-  }
 
-  if (req.b) {
-    opts.body = _base64Decode(req.b);
-    if (req.ct) {
-      if (!opts.headers) opts.headers = {};
-      if (typeof opts.headers === "object") {
-        (opts.headers as Record<string, string>)[ "Content-Type" ] = req.ct;
-      }
+    let payload: Uint8Array | undefined;
+    if (typeof b64 === "string" && b64.length > 0) {
+      payload = decodeBase64ToBytes(b64);
     }
-  }
 
-  if (req.r === false) {
-    opts.redirect = "manual";
-  }
+    const resp = await fetch(u, {
+      method: m,
+      headers: h,
+      body: payload,
+      redirect: "manual",
+    });
 
-  return opts;
-}
+    const data = new Uint8Array(await resp.arrayBuffer());
+    const respHeaders: Record<string, string> = {};
+    resp.headers.forEach((value, key) => {
+      respHeaders[ key ] = value;
+    });
 
-function _respHeaders(resp: Response): Record<string, string> {
-  const headers: Record<string, string> = {};
-  resp.headers.forEach((value, key) => {
-    headers[ key ] = value;
-  });
-  return headers;
-}
-
-// ── Base64 Encoding/Decoding ────────────────────────
-
-function _base64Encode(data: Uint8Array): string {
-  return btoa(String.fromCharCode.apply(null, Array.from(data)));
-}
-
-function _base64Decode(encoded: string): Uint8Array {
-  const binaryString = atob(encoded);
-  const bytes = new Uint8Array(binaryString.length);
-  for (let i = 0; i < binaryString.length; i++) {
-    bytes[ i ] = binaryString.charCodeAt(i);
-  }
-  return bytes;
-}
-
-// ── Main Handler ────────────────────────────────────────
-
-async function handleRequest(request: Request): Promise<Response> {
-  if (request.method === "POST") {
-    return await handlePost(request);
-  } else {
-    return new Response("Method Not Allowed", { status: 405 });
+    return Response.json({
+      s: resp.status,
+      h: respHeaders,
+      b: encodeBytesToBase64(data),
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return Response.json({ e: message }, { status: 500 });
   }
 }
 
-// ── Deno Deploy Entry Point ─────────────────────────────
-
-Deno.serve(handleRequest);
+// ────────────────────────────────────────────────────────
+// Deno Deploy entry point
+// ────────────────────────────────────────────────────────
+Deno.serve(requestHandler);
