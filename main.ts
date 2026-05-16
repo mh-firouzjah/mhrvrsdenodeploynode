@@ -81,126 +81,99 @@ function sanitizeHeaders(h: unknown): Record<string, string> {
   return out;
 }
 
-
-interface ExitNodeRequest {
-  k: string;
-  m?: string;
-  u: string;
-  h?: Record<string, string>;
-  b?: string;
-  ct?: string;
-  r?: boolean;
-}
-
-interface ExitNodeResponse {
-  s: number;
-  h: Record<string, string>;
-  b: string;
-  e?: string;
-}
-
-interface BatchExitNodeRequest {
-  k: string;
-  q: Array<{
-    m?: string;
-    u: string;
-    h?: Record<string, string>;
-    b?: string;
-    ct?: string;
-    r?: boolean;
-  }>;
-}
-
-async function handleSingleRequest(req: ExitNodeRequest): Promise<ExitNodeResponse> {
-  if (!req.u || typeof req.u !== "string" || !req.u.match(/^https?:\/\//i)) {
-    return { s: 400, h: {}, b: "", e: "bad url" };
-  }
-
-  let payload: Uint8Array | undefined;
-  if (typeof req.b === "string" && req.b.length > 0) {
-    payload = decodeBase64ToBytes(req.b);
+export async function handleExitNodeRequest(req: Request): Promise<Response> {
+  // Fail closed on the placeholder PSK so a fresh deploy without setup
+  // can't accidentally serve as an open relay.
+  if (PSK === "CHANGE_ME_TO_A_STRONG_SECRET") {
+    return Response.json(
+      {
+        e:
+          "exit_node misconfigured: PSK is still the placeholder. Set " +
+          "a strong secret in the source before deploying.",
+      },
+      { status: 503 },
+    );
   }
 
   try {
-    const resp = await fetch(req.u, {
-      method: (req.m || "GET").toUpperCase(),
-      headers: req.h || {},
+    if (req.method !== "POST") {
+      return Response.json({ e: "method_not_allowed" }, { status: 405 });
+    }
+
+    const body = await req.json();
+    if (!body || typeof body !== "object") {
+      return Response.json({ e: "bad_json" }, { status: 400 });
+    }
+
+    const k = String((body as any).k ?? "");
+    const u = String((body as any).u ?? "");
+    const m = String((body as any).m ?? "GET").toUpperCase();
+    const h = sanitizeHeaders((body as any).h);
+    const b64 = (body as any).b;
+
+    if (k !== PSK) {
+      return Response.json({ e: "unauthorized" }, { status: 401 });
+    }
+    if (!/^https?:\/\//i.test(u)) {
+      return Response.json({ e: "bad url" }, { status: 400 });
+    }
+
+    // Loop guard: if u points at this exit node's own host, refuse.
+    // Without this, a misconfigured client could chain exit-node →
+    // exit-node → exit-node → ... and burn the host's runtime budget.
+    try {
+      const reqUrl = new URL(req.url);
+      const dstUrl = new URL(u);
+      if (
+        reqUrl.host === dstUrl.host &&
+        reqUrl.protocol === dstUrl.protocol
+      ) {
+        return Response.json({ e: "exit-node loop refused" }, { status: 400 });
+      }
+    } catch {
+      // Malformed URL — let the fetch below 400.
+    }
+
+    let payload: Uint8Array | undefined;
+    if (typeof b64 === "string" && b64.length > 0) {
+      payload = decodeBase64ToBytes(b64);
+    }
+
+    const resp = await fetch(u, {
+      method: m,
+      headers: h,
       body: payload,
       redirect: "manual",
     });
 
+    // `fetch()` (Deno / Bun / Node) auto-decompresses gzip / br / deflate
+    // responses, so `resp.arrayBuffer()` returns plain bytes — but the
+    // destination's `Content-Encoding` header is still on `resp.headers`.
+    // Forwarding it would tell the client browser "this body is gzipped"
+    // when it isn't, producing `Content Encoding Error` (#964). Same goes
+    // for `Content-Length` — the post-decompression byte count is
+    // different from what the destination announced. Strip both. The
+    // Apps Script + Rust transport layer below us re-frames the wire body
+    // anyway, so neither header is meaningful to forward.
     const data = new Uint8Array(await resp.arrayBuffer());
     const respHeaders: Record<string, string> = {};
     resp.headers.forEach((value, key) => {
+      const lower = key.toLowerCase();
+      if (lower === "content-encoding" || lower === "content-length") return;
       respHeaders[ key ] = value;
     });
 
-    return {
+    return Response.json({
       s: resp.status,
       h: respHeaders,
       b: encodeBytesToBase64(data),
-    };
-  } catch (err) {
-    return {
-      s: 502,
-      h: {},
-      b: "",
-      e: String(err),
-    };
-  }
-}
-
-async function handleBatchRequest(
-  req: BatchExitNodeRequest
-): Promise<{ q: ExitNodeResponse[]; }> {
-  const promises = req.q.map((item) =>
-    handleSingleRequest({
-      k: req.k,
-      m: item.m,
-      u: item.u,
-      h: item.h,
-      b: item.b,
-      ct: item.ct,
-      r: item.r,
-    })
-  );
-
-  const results = await Promise.all(promises);
-  return { q: results };
-}
-
-async function handleRequest(request: Request): Promise<Response> {
-  if (request.method !== "POST") {
-    return Response.json({ e: "method_not_allowed" }, { status: 405 });
-  }
-
-  try {
-    const body = await request.json();
-
-    if (typeof body.k !== "string") {
-      return Response.json({ e: "missing auth key" }, { status: 400 });
-    }
-
-    if (body.k !== PSK) {
-      return Response.json({ e: "unauthorized" }, { status: 401 });
-    }
-
-    // Batch mode: { k, q: [...] }
-    if (Array.isArray(body.q)) {
-      const batchResp = await handleBatchRequest(body as BatchExitNodeRequest);
-      return Response.json(batchResp);
-    }
-
-    // Single mode
-    const singleResp = await handleSingleRequest(body as ExitNodeRequest);
-    if (singleResp.e) {
-      return Response.json(singleResp, { status: singleResp.s || 500 });
-    }
-    return Response.json(singleResp);
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return Response.json({ e: message }, { status: 500 });
   }
 }
 
-Deno.serve(handleRequest);
+export default {
+  fetch: handleExitNodeRequest,
+};
